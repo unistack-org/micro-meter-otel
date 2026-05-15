@@ -1,4 +1,4 @@
-module go.unistack.org/micro-meter-prometheus/v5
+module go.unistack.org/micro-meter-otel/v5
 
 go 1.22.0
 
