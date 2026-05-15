@@ -1,0 +1,368 @@
+package prometheus
+
+import (
+	"fmt"
+	"io"
+	"regexp"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
+	"go.unistack.org/micro/v3/meter"
+	xpool "go.unistack.org/micro/v3/util/xpool"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+var _ meter.Meter = (*otelMeter)(nil)
+
+type otelMeter struct {
+	opts         meter.Options
+	set          prometheus.Registerer
+	counter      map[uint64]*prometheusCounter
+	floatCounter map[uint64]*prometheusFloatCounter
+	gauge        map[uint64]*prometheusGauge
+	histogram    map[uint64]*prometheusHistogram
+	summary      map[uint64]*prometheusSummary
+	mfPool       xpool.Pool[*dto.MetricFamily]
+	mu           sync.Mutex
+}
+
+func NewMeter(opts ...meter.Option) *otelMeter {
+	return &otelMeter{
+		set:          prometheus.NewRegistry(), // prometheus.DefaultRegisterer,
+		opts:         meter.NewOptions(opts...),
+		counter:      make(map[uint64]*prometheusCounter),
+		floatCounter: make(map[uint64]*prometheusFloatCounter),
+		gauge:        make(map[uint64]*prometheusGauge),
+		histogram:    make(map[uint64]*prometheusHistogram),
+		summary:      make(map[uint64]*prometheusSummary),
+		mfPool: xpool.NewPool[*dto.MetricFamily](func() *dto.MetricFamily {
+			return &dto.MetricFamily{}
+		}),
+	}
+}
+
+func (m *otelMeter) Name() string {
+	return m.opts.Name
+}
+
+func (m *otelMeter) Counter(name string, labels ...string) meter.Counter {
+	clabels := meter.BuildLabels(append(m.opts.Labels, labels...)...)
+	h := newHash(name, clabels)
+	m.mu.Lock()
+	c, ok := m.counter[h]
+	// fmt.Printf("counter name %s hash %v labels %v\n", name, h, labels)
+	m.mu.Unlock()
+	if !ok {
+		var n float64
+		c = &prometheusCounter{
+			name: name,
+			c: &dto.Metric{
+				Gauge: &dto.Gauge{Value: &n},
+				Label: labelMetric(clabels),
+			},
+		}
+		m.mu.Lock()
+		m.counter[h] = c
+		m.mu.Unlock()
+	}
+	return c
+}
+
+func (m *otelMeter) FloatCounter(name string, labels ...string) meter.FloatCounter {
+	clabels := meter.BuildLabels(append(m.opts.Labels, labels...)...)
+	h := newHash(name, clabels)
+	m.mu.Lock()
+	c, ok := m.floatCounter[h]
+	m.mu.Unlock()
+	if !ok {
+		var n float64
+		c = &prometheusFloatCounter{
+			name: name,
+			c: &dto.Metric{
+				Gauge: &dto.Gauge{Value: &n},
+				Label: labelMetric(clabels),
+			},
+		}
+		m.mu.Lock()
+		m.floatCounter[h] = c
+		m.mu.Unlock()
+	}
+	return c
+}
+
+func (m *otelMeter) Gauge(name string, fn func() float64, labels ...string) meter.Gauge {
+	clabels := meter.BuildLabels(append(m.opts.Labels, labels...)...)
+	h := newHash(name, clabels)
+	m.mu.Lock()
+	c, ok := m.gauge[h]
+	m.mu.Unlock()
+	if !ok {
+		var n float64
+		c = &prometheusGauge{
+			name: name,
+			c: &dto.Metric{
+				Gauge: &dto.Gauge{Value: &n},
+				Label: labelMetric(clabels),
+			},
+		}
+		m.mu.Lock()
+		m.gauge[h] = c
+		m.mu.Unlock()
+	}
+	return c
+}
+
+func (m *otelMeter) Histogram(name string, labels ...string) meter.Histogram {
+	clabels := meter.BuildLabels(append(m.opts.Labels, labels...)...)
+	h := newHash(name, clabels)
+	m.mu.Lock()
+	c, ok := m.histogram[h]
+	m.mu.Unlock()
+	if !ok {
+		var n uint64
+		var s float64
+		buckets := make([]float64, len(prometheus.DefBuckets))
+		copy(buckets, prometheus.DefBuckets)
+		mdto := &dto.Metric{
+			Histogram: &dto.Histogram{
+				SampleCount:      &n,
+				SampleSum:        &s,
+				CreatedTimestamp: timestamppb.Now(),
+				Bucket:           make([]*dto.Bucket, len(buckets)),
+			},
+			Label: labelMetric(clabels),
+		}
+		for idx, b := range buckets {
+			var cc uint64
+			mdto.Histogram.Bucket[idx] = &dto.Bucket{CumulativeCount: &cc, UpperBound: &b}
+		}
+		c = &prometheusHistogram{
+			name: name,
+			c:    mdto,
+		}
+		m.mu.Lock()
+		m.histogram[h] = c
+		m.mu.Unlock()
+	}
+	return c
+}
+
+func (m *otelMeter) Summary(name string, labels ...string) meter.Summary {
+	clabels := meter.BuildLabels(append(m.opts.Labels, labels...)...)
+	h := newHash(name, clabels)
+	m.mu.Lock()
+	c, ok := m.summary[h]
+	m.mu.Unlock()
+	if !ok {
+		var n uint64
+		var s float64
+		c = &prometheusSummary{
+			name: name,
+			c: &dto.Metric{
+				Summary: &dto.Summary{
+					SampleCount:      &n,
+					SampleSum:        &s,
+					CreatedTimestamp: timestamppb.Now(),
+				},
+				Label: labelMetric(clabels),
+			},
+		}
+		m.mu.Lock()
+		m.summary[h] = c
+		m.mu.Unlock()
+	}
+	return c
+}
+
+func (m *otelMeter) SummaryExt(name string, window time.Duration, quantiles []float64, labels ...string) meter.Summary {
+	clabels := meter.BuildLabels(append(m.opts.Labels, labels...)...)
+	h := newHash(name, clabels)
+	m.mu.Lock()
+	c, ok := m.summary[h]
+	m.mu.Lock()
+	if !ok {
+		var n uint64
+		var s float64
+		c = &prometheusSummary{
+			name: name,
+			c: &dto.Metric{
+				Summary: &dto.Summary{
+					SampleCount: &n,
+					SampleSum:   &s,
+				},
+				Label: labelMetric(clabels),
+			},
+		}
+		m.mu.Lock()
+		m.summary[h] = c
+		m.mu.Unlock()
+	}
+	return c
+}
+
+func (m *otelMeter) Init(opts ...meter.Option) error {
+	for _, o := range opts {
+		o(&m.opts)
+	}
+
+	if m.opts.WriteProcessMetrics || m.opts.WriteFDMetrics {
+		pc := collectors.NewProcessCollector(collectors.ProcessCollectorOpts{})
+		_ = m.set.Register(pc)
+		gc := collectors.NewGoCollector(collectors.WithGoCollectorRuntimeMetrics(collectors.GoRuntimeMetricsRule{Matcher: regexp.MustCompile("/.*")}))
+		_ = m.set.Register(gc)
+	}
+
+	return nil
+}
+
+func (m *otelMeter) Write(w io.Writer, opts ...meter.Option) error {
+	options := m.opts
+	for _, o := range opts {
+		o(&options)
+	}
+
+	g, ok := m.set.(prometheus.Gatherer)
+	if !ok {
+		return fmt.Errorf("set type %T not prometheus.Gatherer", m.set)
+	}
+
+	mfs, err := g.Gather()
+	if err != nil {
+		return err
+	}
+
+	enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
+
+	m.mu.Lock()
+
+	for _, mc := range m.counter {
+		mf := m.mfPool.Get()
+		mf.Name = &mc.name
+		mf.Type = dto.MetricType_GAUGE.Enum()
+		n := getFloat64(&(mc.n))
+		mc.c.Gauge.Value = &n
+		mf.Metric = append(mf.Metric, mc.c)
+		mfs = append(mfs, mf)
+	}
+
+	for _, mc := range m.floatCounter {
+		mf := m.mfPool.Get()
+		mf.Name = &mc.name
+		mf.Type = dto.MetricType_GAUGE.Enum()
+		n := getFloat64(&(mc.n))
+		mc.c.Gauge.Value = &n
+		mf.Metric = append(mf.Metric, mc.c)
+		mfs = append(mfs, mf)
+	}
+
+	for _, mc := range m.gauge {
+		mf := m.mfPool.Get()
+		mf.Name = &mc.name
+		mf.Type = dto.MetricType_GAUGE.Enum()
+		n := getFloat64(&(mc.n))
+		mc.c.Gauge.Value = &n
+		mf.Metric = append(mf.Metric, mc.c)
+		mfs = append(mfs, mf)
+	}
+
+	for _, c := range m.histogram {
+		mf := m.mfPool.Get()
+		mf.Name = &c.name
+		mf.Type = dto.MetricType_HISTOGRAM.Enum()
+		mf.Metric = append(mf.Metric, c.c)
+		mfs = append(mfs, mf)
+	}
+
+	for _, mc := range m.summary {
+		mf := m.mfPool.Get()
+		mf.Name = &mc.name
+		mf.Type = dto.MetricType_SUMMARY.Enum()
+		sc := atomic.LoadUint64(&(mc.sampleCount))
+		mc.c.Summary.SampleCount = &sc
+		ss := getFloat64(&(mc.SampleSum))
+		mc.c.Summary.SampleSum = &ss
+		mf.Metric = append(mf.Metric, mc.c)
+		mfs = append(mfs, mf)
+	}
+
+	m.mu.Unlock()
+
+	for _, mf := range mfs {
+		_ = enc.Encode(mf)
+		mf.Reset()
+		m.mfPool.Put(mf)
+	}
+
+	if closer, ok := enc.(io.Closer); ok {
+		_ = closer.Close()
+	}
+
+	return nil
+}
+
+func (m *otelMeter) Clone(opts ...meter.Option) meter.Meter {
+	options := m.opts
+	for _, o := range opts {
+		o(&options)
+	}
+
+	return &otelMeter{
+		set:          m.set,
+		opts:         options,
+		floatCounter: m.floatCounter,
+		counter:      m.counter,
+		gauge:        m.gauge,
+		histogram:    m.histogram,
+		summary:      m.summary,
+	}
+}
+
+func (m *otelMeter) Options() meter.Options {
+	return m.opts
+}
+
+func (m *otelMeter) String() string {
+	return "prometheus"
+}
+
+func (m *otelMeter) Set(opts ...meter.Option) meter.Meter {
+	nm := &otelMeter{opts: m.opts}
+	for _, o := range opts {
+		o(&nm.opts)
+	}
+	nm.set = prometheus.NewRegistry()
+	return nm
+}
+
+func labelMetric(labels []string) []*dto.LabelPair {
+	nl := make([]string, len(labels))
+	copy(nl, labels)
+	dtoLabels := make([]*dto.LabelPair, 0, len(nl)/2)
+	for idx := 0; idx < len(nl); idx += 2 {
+		dtoLabels = append(dtoLabels, &dto.LabelPair{
+			Name:  &(nl[idx]),
+			Value: &(nl[idx+1]),
+		})
+	}
+	return dtoLabels
+}
+
+func newHash(n string, l []string) uint64 {
+	h := uint64(14695981039346656037)
+	for i := 0; i < len(n); i++ {
+		h ^= uint64(n[i])
+		h *= 1099511628211
+	}
+	for _, s := range l {
+		for i := 0; i < len(s); i++ {
+			h ^= uint64(s[i])
+			h *= 1099511628211
+		}
+	}
+	return h
+}

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"go.unistack.org/micro/v4/meter"
+	"go.unistack.org/micro/v5/meter"
 )
 
 func TestStd(t *testing.T) {

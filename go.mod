@@ -1,4 +1,4 @@
-module go.unistack.org/micro-meter-prometheus/v4
+module go.unistack.org/micro-meter-prometheus/v5
 
 go 1.22.0
 
@@ -8,7 +8,7 @@ require (
 	github.com/prometheus/client_golang v1.21.0
 	github.com/prometheus/client_model v0.6.1
 	github.com/prometheus/common v0.62.0
-	go.unistack.org/micro/v4 v4.1.2
+	go.unistack.org/micro/v5 v4.1.2
 )
 
 require (
